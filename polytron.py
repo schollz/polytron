@@ -36,22 +36,37 @@ class Voice:
     def __init__(self, name):
         self.name = name    # instance variable unique to each instance
         self.last_played = time.time()
+        self.is_playing = False 
+        self.adsr = [0,0,0,0]
 
-    def _justsleep(self,t):
-        print("running")
-        logging.info("Thread %s: starting", self.name)
-        time.sleep(t)
-        logging.info("Thread %s: finishing", self.name)
+    def set_adsr(adsr):
+    	self.adsr = adsr 
 
-    def justsleep(self,t):
-        x=threading.Thread(target=self._justsleep,args=(t,))
+    def get_is_playing(self):
+    	return self.is_playing
+
+    def _attack(self):
+        logging.info("setting attack for %ds", self.adsr[0])
+		time.sleep(self.adsr[0])
+
+    def _release(self):
+        logging.info("releasing for  %ds", self.adsr[3])
+
+    def play(self,a,d,s,r):
+        self.is_playing=True
+        x=threading.Thread(target=self._attack,args=(a,d,s,r,))
         x.start()
 
-d=Sample('sample1')
-d2=Sample('sample2')
-print(d.kind)
-d.justsleep(1.1)
-d2.justsleep(1.3)
-print("test")
-time.sleep(3)
-print("done")
+    def stop(self,t):
+        self.is_playing=False
+        x=threading.Thread(target=self._release,args=(t,r))
+        x.start()
+
+# d=Sample('sample1')
+# d2=Sample('sample2')
+# print(d.kind)
+# d.justsleep(1.1)
+# d2.justsleep(1.3)
+# print("test")
+# time.sleep(3)
+# print("done")
