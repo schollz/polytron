@@ -40,14 +40,14 @@ GATE_ON = 1.5
 GATE_OFF = 0
 CHANNEL_GATE = [0x24, 0x26, 0x28]
 CHANNEL_PITCH = [0x23, 0x25, 0x27]
-CHANNEL_CUTOFF = [0x21, 0x22]
+CHANNEL_CUTOFF = [0x21, 0x21, 0x21]
 CHANNEL_NAMES = {}
 for _, v in enumerate(CHANNEL_CUTOFF):
-    CHANNEL_NAMES[v] = "cutoff {}".format(CHANNEL_CUTOFF)
+    CHANNEL_NAMES[v] = "cutoff {}".format(v)
 for _, v in enumerate(CHANNEL_PITCH):
-    CHANNEL_NAMES[v] = "pitch {}".format(CHANNEL_PITCH)
+    CHANNEL_NAMES[v] = "pitch {}".format(v)
 for _, v in enumerate(CHANNEL_GATE):
-    CHANNEL_NAMES[v] = "gate {}".format(CHANNEL_GATE)
+    CHANNEL_NAMES[v] = "gate {}".format(v)
 
 
 def midi2freq(midi_number):
@@ -188,7 +188,7 @@ class Envelope:
 
 
 class Voices:
-    """ 
+    """
     Voices keeps track of the tuning and availability
     of each voice.
     There should be one voice object passed into each
@@ -196,15 +196,17 @@ class Voices:
     Voices are indexed starting at 0.
     """
 
-    def __init__(self, max_voices, voice_envelope_mapping):
+    def __init__(self, max_voices, voice_envelope_mapping=[]):
         self.max_voices = max_voices
         self.voices = [0] * max_voices
-        self.notes_on = {}
+        self.notes_used = {}
+        self.voices_used = {}
         self.tuning = [{}] * max_voices
         self.envelope = []
-        # voice_envelope_mapping = [0,1,1] => maps voice 0 to envelope 0 and voice 1 and 2 to envelope 1
         self.v2e = voice_envelope_mapping
-        for i in range(max(voice_envelope_mapping) + 1):
+        if len(self.v2e) != self.max_voices:
+            self.v2e = list(range(self.max_voices))
+        for i in range(self.max_voices):
             self.envelope.append(Envelope(self.v2e[i]))
 
     def set_adsr(self, voice, a, d, s, r):
@@ -217,8 +219,8 @@ class Voices:
 
     def solo(self, voice):
         """
-        Turns up cutoff for voice 
-        Removes other voices 
+        Turns up cutoff for voice
+        Removes other voices
         """
         for i in range(self.max_voices):
             if i == voice:
@@ -229,7 +231,7 @@ class Voices:
         self.envelope[self.v2e[voice]].on()
 
     def play(self, note):
-        if note in self.notes_on:
+        if note in self.notes_used:
             return
         sem.acquire()
         # find oldest voice
@@ -242,16 +244,15 @@ class Voices:
         self.voices[voice] = time.time()
 
         # remove voice if it was acquired
+        if voice in self.voices_used:
+            note_to_remove = self.voices_used[voice]
+            logger.debug("removing voice {} playing {}", voice, note_to_remove)
+            del self.voices_used[voice]
+            del self.notes_used[note_to_remove]
         delete_note = []
-        for n, v in self.notes_on.items():
-            print(n, v)
-            if v == voice:
-                delete_note.append(n)
-        for _, n in enumerate(delete_note):
-            logger.debug("removing voice {} playing {}", self.notes_on[n], n)
-            del self.notes_on[n]
 
-        self.notes_on[note] = voice
+        self.notes_used[note] = voice
+        self.voices_used[voice] = note
         sem.release()
         logger.debug("playing {} on voice {}", note, voice)
         # TODO: compute voltage from tuning of voice
@@ -259,12 +260,13 @@ class Voices:
         self.envelope[self.v2e[voice]].attack(voice)
 
     def stop(self, note):
-        if note in self.notes_on:
-            voice = self.notes_on[note]
+        if note in self.notes_used:
+            voice = self.notes_used[note]
             logger.debug("stopping {} on voice {}", note, voice)
             self.envelope[self.v2e[voice]].release(voice)
             sem.acquire()
-            del self.notes_on[note]
+            del self.voices_used[voice]
+            del self.notes_used[note]
             sem.release()
 
 
@@ -324,7 +326,7 @@ a.increment()
 b.increment()
 c.increment()
 
-voices = Voices(1, [0])
+voices = Voices(2)
 voices.play(70)
 time.sleep(2)
 voices.play(71)
