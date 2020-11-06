@@ -33,6 +33,8 @@ from mido.ports import MultiPort
 # # Output data to screen
 # print "Voltage : %.2f V" %voltage
 VOLTAGE_VDD = 5.0
+GATE_ON = 1.5
+GATE_OFF = 0
 CHANNEL_GATE = [0x22, 0x23, 0x24, 0x25, 0x26]
 CHANNEL_PITCH = [0x22, 0x23, 0x24, 0x25, 0x26]
 CHANNEL_CUTOFF = [0x21, 0x22]
@@ -77,6 +79,10 @@ def set_voltage(channel, voltage):
 
 
 class Envelope:
+    """
+    Some monotrons may share an envelope.
+    """
+
     max_seconds = 10
     max_voltage = 5.0
     min_voltage = 0.0
@@ -109,6 +115,12 @@ class Envelope:
         self.d = d * max_seconds
         self.s = s * (self.max_voltage - self.min_voltage) + self.min_voltage
         self.r = r * max_seconds
+
+    def on(self):
+        set_voltage(CHANNEL_CUTOFF[self.voice], self.max_voltage)
+
+    def off(self):
+        set_voltage(CHANNEL_CUTOFF[self.voice], self.min_voltage)
 
     def attack(self):
         if self.is_attacking:
@@ -166,6 +178,7 @@ class Voices:
     of each voice.
     There should be one voice object passed into each
     of the keyboards.
+    Voices are indexed starting at 0.
     """
 
     def __init__(self, max_voices, voice_envelope_mapping):
@@ -175,16 +188,30 @@ class Voices:
         self.tuning = [{}] * max_voices
         self.envelope = []
         # voice_envelope_mapping = [0,1,1] => maps voice 0 to envelope 0 and voice 1 and 2 to envelope 1
-        self.voice_envelope_mapping = voice_envelope_mapping
+        self.v2e = voice_envelope_mapping
         for i in range(max(voice_envelope_mapping) + 1):
-            self.envelope.append(Envelope(voice_envelope_mapping[i]))
+            self.envelope.append(Envelope(v2e[i]))
 
     def set_adsr(self, voice, a, d, s, r):
-        self.envelope[voice_envelope_mapping[voice]].set_adsr(a, d, s, r)
+        self.envelope[v2e[voice]].set_adsr(a, d, s, r)
 
     def tune(self):
         # TODO do tuning of each voice
+        # solo each voice one at a time and do tuning
         pass
+
+    def solo(self, voice):
+        """
+        Turns up cutoff for voice 
+        Removes other voices 
+        """
+        for i in range(self.max_voices):
+            if i == voice:
+                set_voltage(CHANNEL_GATE[voice], GATE_ON)
+            else:
+                set_voltage(CHANNEL_GATE[voice], GATE_OFF)
+            self.envelope[self.v2e[i]].off()
+        self.envelope[self.v2e[voice]].on()
 
     def play(self, note):
         if note in notes_on:
@@ -204,14 +231,14 @@ class Voices:
         set_voltage(CHANNEL_GATE[voice], 0)
         # TODO: compute voltage from tuning of voice
         set_voltage(CHANNEL_PITCH[voice], 0)
-        self.envelope[self.voice_envelope_mapping[voice]].attack()
+        self.envelope[self.v2e[voice]].attack()
 
     def stop(self, note):
         if note in notes_on:
             voice = notes_on[note]
             logger.debug("stopping {} on voice {}", note, voice)
             set_voltage(CHANNEL_GATE[voice], 0)
-            self.envelope[voice_envelope_mapping[voice]].release()
+            self.envelope[self.v2e[voice]].release()
             sem.acquire()
             del notes_on[note]
             sem.release()
