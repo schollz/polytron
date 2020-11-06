@@ -1,3 +1,6 @@
+import time
+import sys
+import os
 import logging
 import threading
 
@@ -35,9 +38,16 @@ from mido.ports import MultiPort
 VOLTAGE_VDD = 5.0
 GATE_ON = 1.5
 GATE_OFF = 0
-CHANNEL_GATE = [0x22, 0x23, 0x24, 0x25, 0x26]
-CHANNEL_PITCH = [0x22, 0x23, 0x24, 0x25, 0x26]
+CHANNEL_GATE = [0x24, 0x26, 0x28]
+CHANNEL_PITCH = [0x23, 0x25, 0x27]
 CHANNEL_CUTOFF = [0x21, 0x22]
+CHANNEL_NAMES = {}
+for _, v in enumerate(CHANNEL_CUTOFF):
+    CHANNEL_NAMES[v] = "cutoff {}".format(CHANNEL_CUTOFF)
+for _, v in enumerate(CHANNEL_PITCH):
+    CHANNEL_NAMES[v] = "pitch {}".format(CHANNEL_PITCH)
+for _, v in enumerate(CHANNEL_GATE):
+    CHANNEL_NAMES[v] = "gate {}".format(CHANNEL_GATE)
 
 
 def midi2freq(midi_number):
@@ -76,6 +86,7 @@ def set_voltage(channel, voltage):
     data = [hi, lo]
     sem.release()
     # bus.write_i2c_block_data(0x0E, channel, data)
+    logger.debug("{} set to {:2.2f}", CHANNEL_NAMES[channel], voltage)
 
 
 class Envelope:
@@ -93,10 +104,10 @@ class Envelope:
         self.last_played = time.time()
         self.is_attacking = False
         self.is_releasing = False
-        self.a = 0
-        self.d = 0
-        self.s = 0
-        self.r = 0
+        self.a = 0.1
+        self.d = 0.5
+        self.s = 0.8
+        self.r = 0.5
         self.peak = 1.0
         self.value = 0
 
@@ -122,53 +133,57 @@ class Envelope:
     def off(self):
         set_voltage(CHANNEL_CUTOFF[self.voice], self.min_voltage)
 
-    def attack(self):
+    def attack(self, voice):
         if self.is_attacking:
             return
         self.is_attacking = True
         self.is_releasing = False
-        x = threading.Thread(target=self._attack, args=(a, d, s, r,))
+        x = threading.Thread(target=self._attack, args=(voice,))
         x.start()
 
-    def _attack(self):
-        logger.info("setting attack for %ds", self.a)
+    def _attack(self, voice):
+        set_voltage(CHANNEL_GATE[voice], GATE_ON)
 
         # attack
-        step = (self.peak - self.value) / steps
+        logger.info("attacking for {}s", self.a)
+        step = (self.peak - self.value) / self.steps
         for i in range(self.steps):
             if not self.is_attacking:
                 return
             self._increment_cutoff(step)
-            time.sleep(self.a / steps)
+            time.sleep(self.a / self.steps)
         set_voltage(CHANNEL_CUTOFF[self.voice], self.peak)
 
         # decay
-        step = self.s - self.value
+        logger.info("decaying for {}s", self.d)
+        step = (self.s - self.value) / self.steps
         for i in range(self.steps):
             if not self.is_attacking:
                 return
             self._increment_cutoff(step)
-            time.sleep(self.d / steps)
+            time.sleep(self.d / self.steps)
         set_voltage(CHANNEL_CUTOFF[self.voice], self.s)
         self.is_attacking = False
 
-    def release(self, t):
+    def release(self, voice):
         if self.is_releasing:
             return
         self.is_releasing = True
         self.is_attacking = False
-        x = threading.Thread(target=self._release, args=(t, r))
+        x = threading.Thread(target=self._release, args=(voice,))
         x.start()
 
-    def _release(self):
+    def _release(self, voice):
         # release
-        step = self.min_voltage - self.value
+        logger.info("releasing for {}s", self.r)
+        step = (self.min_voltage - self.value) / self.steps
         for i in range(self.steps):
             if not self.is_releasing:
                 return
             self._increment_cutoff(step)
-            time.sleep(self.d / steps)
-        set_voltage(CHANNEL_CUTOFF[self.voice], min_voltage)
+            time.sleep(self.r / self.steps)
+        set_voltage(CHANNEL_CUTOFF[self.voice], self.min_voltage)
+        set_voltage(CHANNEL_GATE[voice], GATE_OFF)
         self.is_releasing = False
 
 
@@ -190,7 +205,7 @@ class Voices:
         # voice_envelope_mapping = [0,1,1] => maps voice 0 to envelope 0 and voice 1 and 2 to envelope 1
         self.v2e = voice_envelope_mapping
         for i in range(max(voice_envelope_mapping) + 1):
-            self.envelope.append(Envelope(v2e[i]))
+            self.envelope.append(Envelope(self.v2e[i]))
 
     def set_adsr(self, voice, a, d, s, r):
         self.envelope[v2e[voice]].set_adsr(a, d, s, r)
@@ -214,7 +229,7 @@ class Voices:
         self.envelope[self.v2e[voice]].on()
 
     def play(self, note):
-        if note in notes_on:
+        if note in self.notes_on:
             return
         sem.acquire()
         # find oldest voice
@@ -225,22 +240,31 @@ class Voices:
                 oldest = time.time() - v
                 voice = i
         self.voices[voice] = time.time()
+
+        # remove voice if it was acquired
+        delete_note = []
+        for n, v in self.notes_on.items():
+            print(n, v)
+            if v == voice:
+                delete_note.append(n)
+        for _, n in enumerate(delete_note):
+            logger.debug("removing voice {} playing {}", self.notes_on[n], n)
+            del self.notes_on[n]
+
         self.notes_on[note] = voice
         sem.release()
         logger.debug("playing {} on voice {}", note, voice)
-        set_voltage(CHANNEL_GATE[voice], 0)
         # TODO: compute voltage from tuning of voice
         set_voltage(CHANNEL_PITCH[voice], 0)
-        self.envelope[self.v2e[voice]].attack()
+        self.envelope[self.v2e[voice]].attack(voice)
 
     def stop(self, note):
-        if note in notes_on:
-            voice = notes_on[note]
+        if note in self.notes_on:
+            voice = self.notes_on[note]
             logger.debug("stopping {} on voice {}", note, voice)
-            set_voltage(CHANNEL_GATE[voice], 0)
-            self.envelope[self.v2e[voice]].release()
+            self.envelope[self.v2e[voice]].release(voice)
             sem.acquire()
-            del notes_on[note]
+            del self.notes_on[note]
             sem.release()
 
 
@@ -299,6 +323,17 @@ b.increment()
 a.increment()
 b.increment()
 c.increment()
+
+voices = Voices(1, [0])
+voices.play(70)
+time.sleep(2)
+voices.play(71)
+time.sleep(1)
+voices.stop(70)
+time.sleep(1)
+voices.stop(71)
+time.sleep(2)
+
 # d=Sample('sample1')
 # d2=Sample('sample2')
 # print(d.kind)
