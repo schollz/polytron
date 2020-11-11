@@ -3,19 +3,25 @@ import sys
 import os
 import logging
 import threading
+import math
+import json
+from subprocess import Popen, PIPE, STDOUT
+from signal import signal, SIGINT
 
 sem = threading.Semaphore()
 
+import click
+import numpy as np
 from loguru import logger
 import mido
 from mido.ports import MultiPort
+import smbus
+import termplotlib as tpl
 
-
-# import smbus
-# import time
-
-# # Get I2C bus
-# bus = smbus.SMBus(1)
+logger.remove()
+logger.add(sys.stderr, level="ERROR")
+# Get I2C bus
+bus = smbus.SMBus(1)
 
 # # AD5667 address, 0x0E(14)
 # # Select DAC and input register, 0x1F(31)
@@ -36,24 +42,23 @@ from mido.ports import MultiPort
 # # Output data to screen
 # print "Voltage : %.2f V" %voltage
 VOLTAGE_VDD = 5.0
-GATE_ON = 1.5
-GATE_OFF = 0
-CHANNEL_GATE = [0x24, 0x26, 0x28]
-CHANNEL_PITCH = [0x23, 0x25, 0x27]
-CHANNEL_CUTOFF = [0x21, 0x21, 0x21]
+CHANNEL_PITCH = [32, 34, 36]
+CHANNEL_CUTOFF = [33, 35, 37]
 CHANNEL_NAMES = {}
 for _, v in enumerate(CHANNEL_CUTOFF):
     CHANNEL_NAMES[v] = "cutoff {}".format(v)
 for _, v in enumerate(CHANNEL_PITCH):
     CHANNEL_NAMES[v] = "pitch {}".format(v)
-for _, v in enumerate(CHANNEL_GATE):
-    CHANNEL_NAMES[v] = "gate {}".format(v)
 
+def freq2voltage(freq,fitting):
+    return fitting[0] * math.log(freq) + fitting[1]
 
 def midi2freq(midi_number):
     a = 440  # frequency of A (coomon value is 440Hz)
     return (a / 32) * (2 ** ((midi_number - 9) / 12))
 
+def note2voltage(note,fitting):
+    return freq2voltage(midi2freq(note),fitting)
 
 def midi2str(midi_number, sharp=True):
     """
@@ -85,8 +90,71 @@ def set_voltage(channel, voltage):
     hi = n >> 8
     data = [hi, lo]
     sem.release()
-    # bus.write_i2c_block_data(0x0E, channel, data)
-    logger.debug("{} set to {:2.2f}", CHANNEL_NAMES[channel], voltage)
+    bus.write_i2c_block_data(0x56, channel, data)
+    logger.debug("{} set to {:2.2f}", channel, voltage)
+
+#
+# frequency analysis
+#
+
+def get_frequency_analysis():
+    cmd = "arecord -d 1 -f cd -t wav -D sysdefault:CARD=1 /tmp/1s.wav"
+    p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
+    output = p.stdout.read()
+    if b"Recording WAVE" not in output:
+        raise output
+    # cmd = "sox /tmp/1s.wav -n stat -freq"
+    cmd = "aubio pitch -m schmitt -H 1024 /tmp/1s.wav"
+    p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
+    output = p.stdout.read()
+    with open("/tmp/1s.dat", "wb") as f:
+        f.write(output)
+
+    freq = analyze_aubio()
+    return freq
+
+def analyze_aubio():
+    gathered_freqs = []
+    with open("/tmp/1s.dat", "r") as f:
+        linenum = 0
+        for line in f:
+            linenum += 1
+            if linenum < 5:
+                continue
+            s = line.split()
+            if len(s) != 2:
+                continue
+            freq = float(s[1])
+            if freq > 100:
+                gathered_freqs.append(freq)
+    if len(gathered_freqs) == 0:
+        return -1
+    avg = np.median(gathered_freqs)
+    return avg
+
+#
+# plotting 
+#
+
+def plot_points(voltage_to_frequency):
+    x = []
+    y0 = []
+    for k in voltage_to_frequency:
+        x.append(float(k))
+        y0.append(voltage_to_frequency[k])
+    fig = tpl.figure()
+    print("\n")
+    fig.plot(
+        x,
+        y0,
+        plot_command="plot '-' w points",
+        width=50,
+        height=20,
+        xlabel="voltage (v)",
+        title="frequency (hz) vs voltage",
+    )
+    fig.show()
+    print("\n")
 
 
 class Envelope:
@@ -95,9 +163,9 @@ class Envelope:
     """
 
     max_seconds = 10
-    max_voltage = 5.0
+    max_voltage = 3.8
     min_voltage = 0.0
-    steps = 10
+    steps = 50
 
     def __init__(self, voice):
         self.voice = voice
@@ -105,11 +173,12 @@ class Envelope:
         self.is_attacking = False
         self.is_releasing = False
         self.a = 0.1
-        self.d = 0.5
+        self.d = 0.05
         self.s = 0.8
-        self.r = 0.5
+        self.r = 0.1
         self.peak = 1.0
         self.value = 0
+        self.set_adsr(self.peak,self.a,self.d,self.s,self.r)
 
     def _increment_cutoff(self, val):
         self.value = self.value + val
@@ -122,16 +191,16 @@ class Envelope:
     def set_adsr(self, peak, a, d, s, r):
         # all input values are between 0 and 1
         self.peak = peak * (self.max_voltage - self.min_voltage) + self.min_voltage
-        self.a = a * max_seconds
-        self.d = d * max_seconds
+        self.a = a * self.max_seconds
+        self.d = d * self.max_seconds
         self.s = s * (self.max_voltage - self.min_voltage) + self.min_voltage
-        self.r = r * max_seconds
+        self.r = r * self.max_seconds
 
     def on(self):
-        set_voltage(CHANNEL_CUTOFF[self.voice], self.max_voltage)
+        set_voltage(CHANNEL_CUTOFF[self.voice], 5)
 
     def off(self):
-        set_voltage(CHANNEL_CUTOFF[self.voice], self.min_voltage)
+        set_voltage(CHANNEL_CUTOFF[self.voice], 0)
 
     def attack(self, voice):
         if self.is_attacking:
@@ -142,10 +211,8 @@ class Envelope:
         x.start()
 
     def _attack(self, voice):
-        set_voltage(CHANNEL_GATE[voice], GATE_ON)
-
         # attack
-        logger.info("attacking for {}s", self.a)
+        logger.debug("attacking for {}s", self.a)
         step = (self.peak - self.value) / self.steps
         for i in range(self.steps):
             if not self.is_attacking:
@@ -155,7 +222,7 @@ class Envelope:
         set_voltage(CHANNEL_CUTOFF[self.voice], self.peak)
 
         # decay
-        logger.info("decaying for {}s", self.d)
+        logger.debug("decaying for {}s", self.d)
         step = (self.s - self.value) / self.steps
         for i in range(self.steps):
             if not self.is_attacking:
@@ -175,7 +242,7 @@ class Envelope:
 
     def _release(self, voice):
         # release
-        logger.info("releasing for {}s", self.r)
+        logger.debug("releasing for {}s", self.r)
         step = (self.min_voltage - self.value) / self.steps
         for i in range(self.steps):
             if not self.is_releasing:
@@ -183,7 +250,6 @@ class Envelope:
             self._increment_cutoff(step)
             time.sleep(self.r / self.steps)
         set_voltage(CHANNEL_CUTOFF[self.voice], self.min_voltage)
-        set_voltage(CHANNEL_GATE[voice], GATE_OFF)
         self.is_releasing = False
 
 
@@ -203,6 +269,7 @@ class Voices:
         self.voices_used = {}
         self.tuning = [{}] * max_voices
         self.envelope = []
+        self.mbs = [] # stores curve fitting for frequencies
         self.v2e = voice_envelope_mapping
         if len(self.v2e) != self.max_voices:
             self.v2e = list(range(self.max_voices))
@@ -212,10 +279,65 @@ class Voices:
     def set_adsr(self, voice, a, d, s, r):
         self.envelope[v2e[voice]].set_adsr(a, d, s, r)
 
-    def tune(self):
-        # TODO do tuning of each voice
-        # solo each voice one at a time and do tuning
-        pass
+    def tune(self,specific_voice=-1):
+        for voice in range(self.max_voices):
+            if specific_voice > 0 and specific_voice != voice:
+                continue
+            self.off()
+            voltage_to_frequency = {}
+            previous_freq = 0
+            for voltage in range(260,380,5):
+                voltage = float(voltage)/100.0
+                self.solo_voltage(voice,voltage)
+                time.sleep(1)
+                freq = get_frequency_analysis()
+                if freq < previous_freq:
+                    continue
+                voltage_to_frequency[voltage]=freq 
+                previous_freq = freq 
+                os.system("clear")
+                print("voice {}".format(voice))
+                plot_points(voltage_to_frequency)
+            with open("voltage_to_frequency{}.json".format(voice), "w") as f:
+                f.write(json.dumps(voltage_to_frequency))
+        self.off()
+        self.load_tuning()
+
+    def load_tuning(self):
+        self.mbs = []
+        for voice in range(self.max_voices):
+            voltage_to_frequency = json.load(open("voltage_to_frequency{}.json".format(voice), "rb"))
+            x = []
+            y = []
+            y0 = []
+            for k in voltage_to_frequency:
+                x.append(float(k))
+                y0.append(voltage_to_frequency[k])
+                y.append(math.log(voltage_to_frequency[k]))
+            mb = np.polyfit(y, x, 1)
+            fig = tpl.figure()
+            print("\n")
+            fig.plot(
+                x,
+                y0,
+                plot_command="plot '-' w points",
+                width=60,
+                height=22,
+                xlabel="voltage (v)",
+                title="frequency (hz) vs voltage",
+                label="freq = exp((volts{:+2.2f})/{:2.2f})   ".format(mb[1], mb[0]),
+            )
+            fig.show()
+            print("\n")
+            time.sleep(0.1)
+            self.mbs.append(mb)
+
+
+    def solo_voltage(self,voice,voltage):
+        for i in range(self.max_voices):
+            self.envelope[self.v2e[i]].off()
+        self.envelope[self.v2e[voice]].on()
+        set_voltage(CHANNEL_PITCH[voice],voltage)
 
     def solo(self, voice):
         """
@@ -230,10 +352,17 @@ class Voices:
             self.envelope[self.v2e[i]].off()
         self.envelope[self.v2e[voice]].on()
 
-    def play(self, note):
-        if note in self.notes_used:
-            return
-        sem.acquire()
+    def off(self):
+        for i in range(self.max_voices):
+            set_voltage(CHANNEL_CUTOFF[i],0)
+            set_voltage(CHANNEL_PITCH[i],0)
+
+
+    def acquire_voice(self):
+        for voice in range(self.max_voices):
+            if voice not in self.voices_used:
+                return voice 
+        
         # find oldest voice
         oldest = 0
         voice = 1
@@ -241,6 +370,13 @@ class Voices:
             if time.time() - v > oldest:
                 oldest = time.time() - v
                 voice = i
+        return voice 
+
+    def play(self, note):
+        if note in self.notes_used:
+            return
+        sem.acquire()
+        voice = self.acquire_voice()
         self.voices[voice] = time.time()
 
         # remove voice if it was acquired
@@ -254,9 +390,9 @@ class Voices:
         self.notes_used[note] = voice
         self.voices_used[voice] = note
         sem.release()
-        logger.debug("playing {} on voice {}", note, voice)
+        logger.info("playing {} on voice {}", note, voice)
         # TODO: compute voltage from tuning of voice
-        set_voltage(CHANNEL_PITCH[voice], 0)
+        set_voltage(CHANNEL_PITCH[voice], note2voltage(note,self.mbs[voice]))
         self.envelope[self.v2e[voice]].attack(voice)
 
     def stop(self, note):
@@ -271,8 +407,9 @@ class Voices:
 
 
 class Keyboard:
-    def __init__(self, name, voices):
-        self.voices = voices
+    def __init__(self, name, num_voices):
+        self.num_voices = num_voices
+        self.voices = Voices(self.num_voices)
         self.name = name
         name = name.split()
         if len(name) > 2:
@@ -283,64 +420,53 @@ class Keyboard:
         name = name.replace(":", "")
         self.id = name
 
-    def listen(self):
-        t = threading.Thread(target=self._listen, args=())
-        t.daemon = True
-        t.start()
+    def tune(self,specific_voice=-1):
+        self.voices.tune(specific_voice)
 
-    def _listen(self):
+    def load_tuning(self):
+        self.voices.load_tuning()
+
+    def listen(self):
+        for name in mido.get_output_names():
+            t = threading.Thread(target=self._listen, args=(name,))
+            t.daemon = True
+            t.start()
+
+    def play(self,note):
+        self.voices.play(note)
+
+    def stop(self,note):
+        self.voices.stop(note)
+
+    def _listen(self,name):
         with mido.open_input(name) as inport:
             for msg in inport:
                 if msg.type == "note_on":
                     note_name = midi2str(msg.note)
-                    logger.info(
+                    logger.debug(
                         f"[{name}] {note_name} {msg.type} {msg.note} {msg.velocity}"
                     )
                     self.voices.play(msg.note)
+                elif msg.type == "note_off":
+                    note_name = midi2str(msg.note)
+                    logger.debug(
+                        f"[{name}] {note_name} {msg.type} {msg.note} {msg.velocity}"
+                    )
+                    self.voices.stop(msg.note)
 
 
-class A:
-    def __init__(self):
-        self.a = 1
-
-    def increment(self):
-        self.a = self.a + 1
-        print(self.a)
-
-
-class B:
-    def __init__(self, a):
-        self.a = a
-
-    def increment(self):
-        self.a.increment()
-
-
-logger.debug("running")
-a = A()
-a.increment()
-b = B(a)
-c = B(a)
-b.increment()
-a.increment()
-b.increment()
-c.increment()
-
-voices = Voices(2)
-voices.play(70)
-time.sleep(2)
-voices.play(71)
-time.sleep(1)
-voices.stop(70)
-time.sleep(1)
-voices.stop(71)
-time.sleep(2)
-
-# d=Sample('sample1')
-# d2=Sample('sample2')
-# print(d.kind)
-# d.justsleep(1.1)
-# d2.justsleep(1.3)
-# print("test")
+for i in range(32,38):
+    set_voltage(i,0)
+keys = Keyboard("monotron",3)
+# keys.tune()
+keys.load_tuning()
+keys.listen()
+time.sleep(60000)
+# keys.play(60)
+# keys.play(61)
+# keys.play(62)
 # time.sleep(3)
-# print("done")
+# keys.stop(60)
+# keys.stop(61)
+# keys.stop(62)
+# time.sleep(3)
