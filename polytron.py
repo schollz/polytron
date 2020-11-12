@@ -3,6 +3,7 @@ import sys
 import os
 import logging
 import threading
+import random
 import math
 import json
 from subprocess import Popen, PIPE, STDOUT
@@ -23,24 +24,6 @@ logger.add(sys.stderr, level="ERROR")
 # Get I2C bus
 bus = smbus.SMBus(1)
 
-# # AD5667 address, 0x0E(14)
-# # Select DAC and input register, 0x1F(31)
-# #     0x8000(32768)
-# voltage=3.33
-# n = int(voltage/5.0*65535)
-# lo = n & 0x00ff
-# hi = n  >> 8
-# data=[hi,lo]
-# data = [0x80, 0x00]
-# bus.write_i2c_block_data(0x0E, 0x1F, data)
-
-# time.sleep(0.5)
-
-# # Convert the data
-# voltage = ((data[0] * 256 + data[1]) / 65536.0) * 5.0
-
-# # Output data to screen
-# print "Voltage : %.2f V" %voltage
 VOLTAGE_VDD = 5.0
 CHANNEL_PITCH = [32, 34, 36]
 CHANNEL_CUTOFF = [33, 35, 37]
@@ -90,6 +73,7 @@ def set_voltage(channel, voltage):
     hi = n >> 8
     data = [hi, lo]
     sem.release()
+    # 0x56 determined by sudo i2cdetect -y 1
     bus.write_i2c_block_data(0x56, channel, data)
     logger.debug("{} set to {:2.2f}", channel, voltage)
 
@@ -163,7 +147,7 @@ class Envelope:
     """
 
     max_seconds = 10
-    max_voltage = 3.8
+    max_voltage = 4.0
     min_voltage = 0.0
     steps = 50
 
@@ -172,10 +156,12 @@ class Envelope:
         self.last_played = time.time()
         self.is_attacking = False
         self.is_releasing = False
-        self.a = 0.1
+        self.a = 0.5
         self.d = 0.05
-        self.s = 0.8
-        self.r = 0.1
+        self.s = 0.5
+        self.r = 0.4
+        self.a= 0.1
+        self.r = 0.3
         self.peak = 1.0
         self.value = 0
         self.set_adsr(self.peak,self.a,self.d,self.s,self.r)
@@ -202,24 +188,27 @@ class Envelope:
     def off(self):
         set_voltage(CHANNEL_CUTOFF[self.voice], 0)
 
-    def attack(self, voice):
+    def attack(self, voice, velocity):
         if self.is_attacking:
             return
         self.is_attacking = True
         self.is_releasing = False
-        x = threading.Thread(target=self._attack, args=(voice,))
+        x = threading.Thread(target=self._attack, args=(voice, velocity,))
         x.start()
 
-    def _attack(self, voice):
+    def _attack(self, voice, velocity):
         # attack
         logger.debug("attacking for {}s", self.a)
-        step = (self.peak - self.value) / self.steps
+        step = (self.peak*velocity - self.value) / self.steps
+        a = self.a - (velocity)*self.max_seconds # shorten attack if played harder
+        if a < 0:
+            a = 0.1
         for i in range(self.steps):
             if not self.is_attacking:
                 return
             self._increment_cutoff(step)
-            time.sleep(self.a / self.steps)
-        set_voltage(CHANNEL_CUTOFF[self.voice], self.peak)
+            time.sleep(a / self.steps)
+        set_voltage(CHANNEL_CUTOFF[self.voice], self.peak*velocity )
 
         # decay
         logger.debug("decaying for {}s", self.d)
@@ -267,14 +256,19 @@ class Voices:
         self.voices = [0] * max_voices
         self.notes_used = {}
         self.voices_used = {}
+        self.last_note = {}
         self.tuning = [{}] * max_voices
         self.envelope = []
+        self.portamento=[0]*max_voices
         self.mbs = [] # stores curve fitting for frequencies
         self.v2e = voice_envelope_mapping
         if len(self.v2e) != self.max_voices:
             self.v2e = list(range(self.max_voices))
         for i in range(self.max_voices):
             self.envelope.append(Envelope(self.v2e[i]))
+
+    def set_portamento(self,voice,portamento):
+        self.portamento[voice]=portamento
 
     def set_adsr(self, voice, a, d, s, r):
         self.envelope[v2e[voice]].set_adsr(a, d, s, r)
@@ -372,7 +366,7 @@ class Voices:
                 voice = i
         return voice 
 
-    def play(self, note):
+    def play(self, note, velocity):
         if note in self.notes_used:
             return
         sem.acquire()
@@ -391,9 +385,39 @@ class Voices:
         self.voices_used[voice] = note
         sem.release()
         logger.info("playing {} on voice {}", note, voice)
-        # TODO: compute voltage from tuning of voice
+
+        # do legato
+        if voice in self.last_note and self.portamento[voice] > 0:
+            x = threading.Thread(target=self.play_legato, args=(voice,self.last_note[voice],note,))
+            x.start()
+        else:
+            set_voltage(CHANNEL_PITCH[voice], note2voltage(note,self.mbs[voice]))
+        self.envelope[self.v2e[voice]].attack(voice,velocity)
+        self.last_note[voice]=note 
+
+    def play_detuned(self,voice,note):
         set_voltage(CHANNEL_PITCH[voice], note2voltage(note,self.mbs[voice]))
-        self.envelope[self.v2e[voice]].attack(voice)
+        freq = midi2freq(note)
+        min_freq = freq*(1-0.005)
+        max_freq = freq*(1+0.005)
+        for i in range(30):
+            if voice not in self.voices_used or self.voices_used[voice] != note: # note is canceled
+                return
+            set_voltage(CHANNEL_PITCH[voice],freq2voltage(random.random()*(max_freq-min_freq)+min_freq,self.mbs[voice]))
+            time.sleep(0.05)
+
+    def play_legato(self,voice,note1,note2):
+        set_voltage(CHANNEL_PITCH[voice], note2voltage(note1,self.mbs[voice]))
+        freq1 = midi2freq(note1)
+        freq2 = midi2freq(note2)
+        steps = int(self.portamento[voice]/0.025)
+        for i in range(steps):
+            if voice not in self.voices_used or self.voices_used[voice] != note2: # note is canceled
+                return
+            time.sleep(0.025)
+            set_voltage(CHANNEL_PITCH[voice],freq2voltage( (freq2-freq1)*(i/steps)+freq1,self.mbs[voice] ) )
+        set_voltage(CHANNEL_PITCH[voice],freq2voltage(freq2,self.mbs[voice]))
+
 
     def stop(self, note):
         if note in self.notes_used:
@@ -432,8 +456,8 @@ class Keyboard:
             t.daemon = True
             t.start()
 
-    def play(self,note):
-        self.voices.play(note)
+    def play(self,note,velocity):
+        self.voices.play(note,velocity)
 
     def stop(self,note):
         self.voices.stop(note)
@@ -446,7 +470,7 @@ class Keyboard:
                     logger.debug(
                         f"[{name}] {note_name} {msg.type} {msg.note} {msg.velocity}"
                     )
-                    self.voices.play(msg.note)
+                    self.voices.play(msg.note,msg.velocity/127)
                 elif msg.type == "note_off":
                     note_name = midi2str(msg.note)
                     logger.debug(
