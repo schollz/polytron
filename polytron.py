@@ -25,8 +25,9 @@ logger.add(sys.stderr, level="ERROR")
 bus = smbus.SMBus(1)
 
 VOLTAGE_VDD = 5.0
-CHANNEL_PITCH = [32, 34, 36]
-CHANNEL_CUTOFF = [33, 35, 37]
+VOLTAGE_RAIL = 5.0
+CHANNEL_PITCH = [32, 34, 36, 38]
+CHANNEL_CUTOFF = [33, 35, 37, 39]
 CHANNEL_NAMES = {}
 for _, v in enumerate(CHANNEL_CUTOFF):
     CHANNEL_NAMES[v] = "cutoff {}".format(v)
@@ -82,7 +83,7 @@ def set_voltage(channel, voltage):
 #
 
 def get_frequency_analysis():
-    cmd = "arecord -d 1 -f cd -t wav -D sysdefault:CARD=1 /tmp/1s.wav"
+    cmd = "arecord -d 1 -f cd -t wav -D sysdefault:CARD=2 /tmp/1s.wav"
     p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
     output = p.stdout.read()
     if b"Recording WAVE" not in output:
@@ -103,13 +104,13 @@ def analyze_aubio():
         linenum = 0
         for line in f:
             linenum += 1
-            if linenum < 5:
+            if linenum < 10:
                 continue
             s = line.split()
             if len(s) != 2:
                 continue
             freq = float(s[1])
-            if freq > 100:
+            if freq > 50:
                 gathered_freqs.append(freq)
     if len(gathered_freqs) == 0:
         return -1
@@ -147,7 +148,7 @@ class Envelope:
     """
 
     max_seconds = 10
-    max_voltage = 4.0
+    max_voltage = VOLTAGE_RAIL
     min_voltage = 0.0
     steps = 50
 
@@ -156,12 +157,10 @@ class Envelope:
         self.last_played = time.time()
         self.is_attacking = False
         self.is_releasing = False
-        self.a = 0.5
-        self.d = 0.05
-        self.s = 0.5
-        self.r = 0.4
-        self.a= 0.1
-        self.r = 0.3
+        self.a = 0.6
+        self.d = 0.1
+        self.s = 1.0
+        self.r = 1.0
         self.peak = 1.0
         self.value = 0
         self.set_adsr(self.peak,self.a,self.d,self.s,self.r)
@@ -183,7 +182,7 @@ class Envelope:
         self.r = r * self.max_seconds
 
     def on(self):
-        set_voltage(CHANNEL_CUTOFF[self.voice], 5)
+        set_voltage(CHANNEL_CUTOFF[self.voice], VOLTAGE_RAIL)
 
     def off(self):
         set_voltage(CHANNEL_CUTOFF[self.voice], 0)
@@ -200,7 +199,7 @@ class Envelope:
         # attack
         logger.debug("attacking for {}s", self.a)
         step = (self.peak*velocity - self.value) / self.steps
-        a = self.a - (velocity)*self.max_seconds # shorten attack if played harder
+        a = self.a - 0.2*(velocity)*self.max_seconds # shorten attack if played harder
         if a < 0:
             a = 0.1
         for i in range(self.steps):
@@ -212,13 +211,14 @@ class Envelope:
 
         # decay
         logger.debug("decaying for {}s", self.d)
-        step = (self.s - self.value) / self.steps
+        s = self.s*velocity
+        step = (s - self.value) / self.steps
         for i in range(self.steps):
             if not self.is_attacking:
                 return
             self._increment_cutoff(step)
             time.sleep(self.d / self.steps)
-        set_voltage(CHANNEL_CUTOFF[self.voice], self.s)
+        set_voltage(CHANNEL_CUTOFF[self.voice], s)
         self.is_attacking = False
 
     def release(self, voice):
@@ -280,7 +280,7 @@ class Voices:
             self.off()
             voltage_to_frequency = {}
             previous_freq = 0
-            for voltage in range(260,380,5):
+            for voltage in range(210,300,5):
                 voltage = float(voltage)/100.0
                 self.solo_voltage(voice,voltage)
                 time.sleep(1)
@@ -319,11 +319,15 @@ class Voices:
                 height=22,
                 xlabel="voltage (v)",
                 title="frequency (hz) vs voltage",
-                label="freq = exp((volts{:+2.2f})/{:2.2f})   ".format(mb[1], mb[0]),
+                label="volts = {:2.2f}*log(freq){:+2.2f}   ".format(mb[0], mb[1]),
             )
             fig.show()
             print("\n")
             time.sleep(0.1)
+            if mb[0] < 0.5:
+                mb[0] = 0.64
+            if mb[1] > 1: 
+                mb[1] = -1
             self.mbs.append(mb)
 
 
@@ -463,26 +467,27 @@ class Keyboard:
         self.voices.stop(note)
 
     def _listen(self,name):
+        logger.info("listening to {}",name)
         with mido.open_input(name) as inport:
             for msg in inport:
                 if msg.type == "note_on":
                     note_name = midi2str(msg.note)
-                    logger.debug(
+                    logger.info(
                         f"[{name}] {note_name} {msg.type} {msg.note} {msg.velocity}"
                     )
-                    self.voices.play(msg.note,msg.velocity/127)
+                    self.voices.play(msg.note,127/127)
                 elif msg.type == "note_off":
                     note_name = midi2str(msg.note)
-                    logger.debug(
+                    logger.info(
                         f"[{name}] {note_name} {msg.type} {msg.note} {msg.velocity}"
                     )
                     self.voices.stop(msg.note)
 
 
-for i in range(32,38):
+for i in range(32,40):
     set_voltage(i,0)
-keys = Keyboard("monotron",3)
-# keys.tune()
+keys = Keyboard("monotron",4)
+keys.tune()
 keys.load_tuning()
 keys.listen()
 time.sleep(60000)
