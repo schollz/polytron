@@ -20,7 +20,7 @@ import smbus
 import termplotlib as tpl
 
 logger.remove()
-logger.add(sys.stderr, level="ERROR")
+logger.add(sys.stderr, level="INFO")
 # Get I2C bus
 bus = smbus.SMBus(1)
 
@@ -82,6 +82,8 @@ def set_voltage(channel, voltage):
 # frequency analysis
 #
 
+
+
 def get_frequency_analysis():
     cmd = "arecord -d 1 -f cd -t wav -D sysdefault:CARD=2 /tmp/1s.wav"
     p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
@@ -115,6 +117,7 @@ def analyze_aubio():
     if len(gathered_freqs) == 0:
         return -1
     avg = np.median(gathered_freqs)
+    logger.debug("got frequency {}",avg)
     return avg
 
 #
@@ -157,10 +160,10 @@ class Envelope:
         self.last_played = time.time()
         self.is_attacking = False
         self.is_releasing = False
-        self.a = 0.6
+        self.a = 0.3
         self.d = 0.1
         self.s = 1.0
-        self.r = 1.0
+        self.r = 0.5
         self.peak = 1.0
         self.value = 0
         self.set_adsr(self.peak,self.a,self.d,self.s,self.r)
@@ -273,6 +276,41 @@ class Voices:
     def set_adsr(self, voice, a, d, s, r):
         self.envelope[v2e[voice]].set_adsr(a, d, s, r)
 
+    def tune_specific(self, specific_voice=-1):
+        for voice in range(self.max_voices):
+            if specific_voice > 0 and specific_voice != voice:
+                continue
+            self.off()
+            note_to_voltage = {}
+            voltage_to_frequency2 = {}
+            previous_freq = 0
+            for midinote in range(60,70):
+                target_freq = midi2freq(midinote)
+                mid_voltage = note2voltage(midinote,self.mbs[voice])
+                logger.info("target: {:2.2f}",target_freq)
+                logger.info("current voltage: {:2.3f}",mid_voltage)
+                vs = []
+                fs = []
+                for voltage in np.arange(mid_voltage-0.006,mid_voltage+0.012,0.002):
+                    self.solo_voltage(voice,voltage)
+                    time.sleep(0.5)
+                    freq = get_frequency_analysis()
+                    print("{:2.3f} {:2.2f}".format(voltage,freq))
+                    vs.append(voltage)
+                    fs.append(freq)
+                mb = np.polyfit(fs, vs, 1)
+                good_voltage = mb[0]*target_freq+mb[1]
+                logger.info("new voltage: {}",good_voltage)
+                voltage_to_frequency2[good_voltage] = target_freq
+                note_to_voltage[midinote] = good_voltage
+                with open("voltage_to_frequency2{}.json".format(voice), "w") as f:
+                    f.write(json.dumps(voltage_to_frequency2))
+                with open("note_to_voltage{}.json".format(voice), "w") as f:
+                    f.write(json.dumps(note_to_voltage))
+        self.off()
+        self.load_tuning()
+
+
     def tune(self,specific_voice=-1):
         for voice in range(self.max_voices):
             if specific_voice > 0 and specific_voice != voice:
@@ -292,6 +330,7 @@ class Voices:
                 os.system("clear")
                 print("voice {}".format(voice))
                 plot_points(voltage_to_frequency)
+                logger.debug("voltage -> freq: {} -> {}",voltage,freq)
             with open("voltage_to_frequency{}.json".format(voice), "w") as f:
                 f.write(json.dumps(voltage_to_frequency))
         self.off()
@@ -299,7 +338,12 @@ class Voices:
 
     def load_tuning(self):
         self.mbs = []
+        self.note_to_voltage = [{}]*self.max_voices
         for voice in range(self.max_voices):
+            try:
+                self.note_to_voltage[voice] = json.load(open("note_to_voltage{}.json".format(voice), "rb"))
+            except:
+                pass
             voltage_to_frequency = json.load(open("voltage_to_frequency{}.json".format(voice), "rb"))
             x = []
             y = []
@@ -388,26 +432,40 @@ class Voices:
         self.notes_used[note] = voice
         self.voices_used[voice] = note
         sem.release()
-        logger.info("playing {} on voice {}", note, voice)
+        logger.info("playing {} ({:2.1f}) on voice {}", note, midi2freq(note), voice)
 
         # do legato
         if voice in self.last_note and self.portamento[voice] > 0:
             x = threading.Thread(target=self.play_legato, args=(voice,self.last_note[voice],note,))
             x.start()
         else:
-            set_voltage(CHANNEL_PITCH[voice], note2voltage(note,self.mbs[voice]))
+            # x = threading.Thread(target=self.play_detuned, args=(voice,note,))
+            # x.start()
+            self._play(voice,note)
         self.envelope[self.v2e[voice]].attack(voice,velocity)
         self.last_note[voice]=note 
 
+    def _play(self,voice,note,voltage=0):
+        if voltage == 0:
+            voltage = note2voltage(note,self.mbs[voice])
+            if str(note) in self.note_to_voltage[voice]:
+                logger.info("got voltage from note map")
+                voltage = self.note_to_voltage[voice][str(note)]
+            else:
+                logger.info("not in map")
+                print(self.note_to_voltage)
+        set_voltage(CHANNEL_PITCH[voice], voltage)
+
+
     def play_detuned(self,voice,note):
-        set_voltage(CHANNEL_PITCH[voice], note2voltage(note,self.mbs[voice]))
+        self._play(voice,note)
         freq = midi2freq(note)
-        min_freq = freq*(1-0.005)
-        max_freq = freq*(1+0.005)
-        for i in range(30):
+        min_freq = freq*(1-0.02)
+        max_freq = freq*(1+0.02)
+        for i in range(100):
             if voice not in self.voices_used or self.voices_used[voice] != note: # note is canceled
                 return
-            set_voltage(CHANNEL_PITCH[voice],freq2voltage(random.random()*(max_freq-min_freq)+min_freq,self.mbs[voice]))
+            self._play(voice,note,voltage=freq2voltage(random.random()*(max_freq-min_freq)+min_freq,self.mbs[voice]))
             time.sleep(0.05)
 
     def play_legato(self,voice,note1,note2):
@@ -451,6 +509,10 @@ class Keyboard:
     def tune(self,specific_voice=-1):
         self.voices.tune(specific_voice)
 
+    def tune_specific(self,specific_voice=-1):
+        self.voices.load_tuning()
+        self.voices.tune_specific(specific_voice)
+
     def load_tuning(self):
         self.voices.load_tuning()
 
@@ -487,7 +549,7 @@ class Keyboard:
 for i in range(32,40):
     set_voltage(i,0)
 keys = Keyboard("monotron",4)
-keys.tune()
+# keys.tune_specific()
 keys.load_tuning()
 keys.listen()
 time.sleep(60000)
